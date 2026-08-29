@@ -102,7 +102,7 @@ esac
 preflight() {
 	missing=""
 	[ "$(id -u)" -eq 0 ] || missing="$missing root(sudo)"
-	for tool in nginx systemctl curl tar runuser useradd; do
+	for tool in nginx systemctl curl tar runuser useradd sudo; do
 		command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
 	done
 	if [ -n "$missing" ]; then
@@ -162,6 +162,7 @@ ensure_user() {
 	fi
 	act install -d -o riam -g riam -m 755 "$BIN_DIR"
 	act install -d -o riam -g riam -m 750 "$DATA_DIR"
+	act install -d -o riam -g riam -m 700 "$DATA_DIR/workspace"
 	act chmod 750 "$RIAM_HOME"
 }
 
@@ -173,8 +174,16 @@ grant_nginx() {
 	if ! id -u "$nginx_user" >/dev/null 2>&1; then
 		[ "$dry_run" -eq 1 ] || die "cannot find nginx's user ($nginx_user)"
 	fi
+	if id -nG "$nginx_user" 2>/dev/null | tr ' ' '\n' | grep -qx riam; then
+		say "nginx user $nginx_user already in the riam group"
+		return 0
+	fi
 	act usermod -aG riam "$nginx_user"
 	say "nginx user $nginx_user joined the riam group (socket access)"
+	if systemctl is-active --quiet nginx; then
+		act systemctl restart nginx
+		say "nginx restarted so its workers pick up the new group"
+	fi
 }
 
 # --- binary -----------------------------------------------------------------
@@ -229,7 +238,8 @@ install_binary() {
 		cat >"$wrap" <<WRAP
 #!/bin/sh
 [ "\$(id -un)" = "riam" ] && exec $BIN_DIR/riam "\$@"
-exec sudo -u riam HOME=$RIAM_HOME $BIN_DIR/riam "\$@"
+cd $RIAM_HOME 2>/dev/null || cd /
+exec sudo -u riam env HOME=$RIAM_HOME $BIN_DIR/riam "\$@"
 WRAP
 	fi
 	act chmod 0755 "$wrap"
@@ -319,9 +329,13 @@ StartLimitBurst=5
 User=riam
 Group=riam
 Environment=HOME=$RIAM_HOME
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WorkingDirectory=$DATA_DIR/workspace
+UMask=0077
 ExecStart=$BIN_DIR/riam daemon
 Restart=always
 RestartSec=2
+TimeoutStopSec=20
 
 [Install]
 WantedBy=multi-user.target

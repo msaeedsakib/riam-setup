@@ -41,6 +41,36 @@ riam update --now
 riam update --rollback
 ```
 
+Re-running the installer on a box that already has riam upgrades it in place and
+rewrites the systemd unit, so a release that changes the unit needs nothing by hand.
+
+## Backups
+
+```sh
+riam backup
+```
+
+writes `/home/riam/.riam/backups/riam-backup-<date>.tar.gz`: config, `mcp.json`,
+`secrets.json`, a WAL-safe database snapshot, skills, attachments and shared files. The
+archive is owner-only and holds your secrets, so fetch it as your own user with:
+
+```sh
+sudo -u riam cat /home/riam/.riam/backups/riam-backup-<date>.tar.gz > riam-backup.tar.gz
+```
+
+Restore with `riam restore <archive>`; the archive has to be readable by the riam user
+(copy it to `/tmp` first if it is not), and it applies on the daemon's next start.
+
+## Diagnosing
+
+```sh
+riam push test        # send a test push to every subscribed device and report per endpoint
+riam debug-mcp        # serve RIAM's read-only debug tools (logs, push status, config, …) over MCP on stdio
+```
+
+`riam debug-mcp` is meant to be run by an MCP client over SSH; the SSH login and the
+owner-only admin socket are its only authentication.
+
 ## Uninstalling
 
 ```sh
