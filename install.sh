@@ -7,7 +7,7 @@ set -eu
 if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi
 
 BASE_URL="${RIAM_BASE_URL:-https://github.com/msaeedsakib/riam-setup/releases/latest/download}"
-RIAM_HOME="/home/riam"
+RIAM_HOME="${RIAM_HOME:-/home/riam}"
 BIN_DIR="$RIAM_HOME/bin"
 DATA_DIR="$RIAM_HOME/.riam"
 WEBROOT="/var/www/riam-acme"
@@ -37,12 +37,20 @@ act() {
 as_riam() {
 	act runuser -u riam -- env HOME="$RIAM_HOME" "$@"
 }
+# Piped installs make the script itself stdin, so prompts must read the terminal.
+ask() {
+	read -r "$1" </dev/tty 2>/dev/null ||
+		die "cannot prompt without a terminal — set RIAM_DOMAIN and RIAM_ACME_EMAIL"
+}
 
 usage() {
 	cat <<'EOF'
 RIAM installer (linux-aarch64, run as root)
 
   sudo sh install.sh [options]
+
+On a box that already has riam, the script upgrades it in place: no prompts, nginx
+and certs untouched, the daemon restarted on the new binary.
 
 Options:
   --dry-run          print every action without doing any of it
@@ -121,7 +129,7 @@ ask_domain() {
 	if [ -z "$domain" ]; then
 		[ "$dry_run" -eq 1 ] && die "dry run needs RIAM_DOMAIN set (no prompt)"
 		printf 'Domain RIAM will be served at (e.g. riam.example.com): '
-		read -r domain
+		ask domain
 	fi
 	printf '%s' "$domain" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' ||
 		die "that does not look like a domain: $domain"
@@ -214,8 +222,19 @@ install_binary() {
 	act chown riam:riam "$tmp"
 	act chmod 0755 "$tmp"
 	act mv -f "$tmp" "$BIN_DIR/riam"
-	act ln -sf "$BIN_DIR/riam" /usr/local/bin/riam
-	say "Installed riam -> $BIN_DIR/riam (symlink /usr/local/bin/riam)"
+	wrap="/usr/local/bin/.riam.wrap.$$"
+	if [ "$dry_run" -eq 1 ]; then
+		say "  would: write the /usr/local/bin/riam wrapper"
+	else
+		cat >"$wrap" <<WRAP
+#!/bin/sh
+[ "\$(id -un)" = "riam" ] && exec $BIN_DIR/riam "\$@"
+exec sudo -u riam HOME=$RIAM_HOME $BIN_DIR/riam "\$@"
+WRAP
+	fi
+	act chmod 0755 "$wrap"
+	act mv -f "$wrap" /usr/local/bin/riam
+	say "Installed riam -> $BIN_DIR/riam (wrapper /usr/local/bin/riam)"
 }
 
 read_release_index() {
@@ -266,21 +285,21 @@ obtain_binary() {
 
 # --- config, systemd --------------------------------------------------------
 
+# A config with only [server] does not parse; the daemon must write its full template first.
 write_config() {
 	cfg="$DATA_DIR/config.toml"
 	if [ "$dry_run" -eq 1 ]; then
-		say "  would: ensure [server] domain = \"$domain\" in $cfg"
+		say "  would: append [server] domain = \"$domain\" to $cfg and restart riam"
 		return 0
 	fi
-	if [ ! -f "$cfg" ]; then
-		printf '[server]\ndomain = "%s"\n' "$domain" >"$cfg"
-		chown riam:riam "$cfg"
-		chmod 600 "$cfg"
-	elif ! grep -q '^\[server\]' "$cfg"; then
-		printf '\n[server]\ndomain = "%s"\n' "$domain" >>"$cfg"
-	else
+	[ -f "$cfg" ] || die "the daemon never wrote $cfg — check: journalctl -u riam"
+	if grep -q '^\[server\]' "$cfg"; then
 		warn "Note: $cfg already has a [server] section; make sure domain = \"$domain\""
+		return 0
 	fi
+	printf '\n[server]\ndomain = "%s"\n' "$domain" >>"$cfg"
+	systemctl restart riam
+	wait_for_socket
 }
 
 write_unit() {
@@ -293,6 +312,8 @@ write_unit() {
 Description=RIAM daemon
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 User=riam
@@ -354,7 +375,7 @@ issue_certs() {
 	if [ ! -x "$ACME" ]; then
 		if [ -z "$acme_email" ]; then
 			printf 'Email for the Let'\''s Encrypt account (expiry notices): '
-			read -r acme_email
+			ask acme_email
 		fi
 		curl -fsSL https://get.acme.sh | sh -s "email=$acme_email"
 	fi
@@ -446,7 +467,49 @@ print_claim() {
 	say "  $url"
 }
 
+# --- upgrade ----------------------------------------------------------------
+
+existing_install() {
+	[ -x "$BIN_DIR/riam" ] && [ -f "$DATA_DIR/config.toml" ]
+}
+
+# The domain an existing box already serves: the daemon's config first, then nginx.
+detect_domain() {
+	[ -n "$domain" ] && return 0
+	domain="$(awk -F'"' '/^\[server\]/ { s = 1; next } /^\[/ { s = 0 } s && $1 ~ /^domain[ \t]*=/ { print $2; exit }' "$DATA_DIR/config.toml" 2>/dev/null)"
+	[ -n "$domain" ] ||
+		domain="$(awk '$1 == "server_name" { gsub(";", "", $2); print $2; exit }' "$NGINX_CONF" 2>/dev/null)"
+	[ -n "$domain" ] || die "could not tell which domain this box serves — set RIAM_DOMAIN"
+}
+
+installed_version() {
+	v="$(runuser -u riam -- env HOME="$RIAM_HOME" "$BIN_DIR/riam" --version 2>/dev/null)" || v=""
+	v="$(printf '%s' "$v" | awk '{print $NF; exit}')"
+	printf '%s' "${v:-unknown}"
+}
+
+upgrade() {
+	[ "$dry_run" -eq 1 ] && say "=== DRY RUN (no changes will be made) ==="
+	preflight
+	detect_domain
+	old="$(installed_version)"
+	say "Existing install: riam $old at $BIN_DIR, serving $domain — upgrading in place"
+	ensure_user
+	grant_nginx
+	obtain_binary
+	write_unit
+	act systemctl restart riam
+	wait_for_socket
+	verify_health
+	say ""
+	say "Upgraded riam $old -> $VERSION. From any sudo user: riam update --now"
+}
+
 main() {
+	if existing_install; then
+		upgrade
+		return 0
+	fi
 	[ "$dry_run" -eq 1 ] && say "=== DRY RUN (no changes will be made) ==="
 	preflight
 	ask_domain
@@ -455,9 +518,9 @@ main() {
 	ensure_user
 	grant_nginx
 	obtain_binary
-	write_config
 	write_unit
 	wait_for_socket
+	write_config
 	write_nginx_http_only
 	issue_certs
 	write_nginx_full
