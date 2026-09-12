@@ -181,8 +181,9 @@ grant_nginx() {
 	act usermod -aG riam "$nginx_user"
 	say "nginx user $nginx_user joined the riam group (socket access)"
 	if systemctl is-active --quiet nginx; then
+		say "restarting nginx so its workers pick up the riam group; a reload would not, and every other site on this nginx drops its connections for a moment"
 		act systemctl restart nginx
-		say "nginx restarted so its workers pick up the new group"
+		say "nginx restarted"
 	fi
 }
 
@@ -357,13 +358,37 @@ wait_for_socket() {
 
 # --- nginx + certs ----------------------------------------------------------
 
+# Install the vhost on stdin only if nginx accepts the whole tree with it in place; a rejected
+# file is rolled back, so a failed install never leaves nginx unloadable for every other site.
+install_vhost() {
+	cat >"$NGINX_CONF.new"
+	had_prev=0
+	if [ -f "$NGINX_CONF" ]; then
+		mv "$NGINX_CONF" "$NGINX_CONF.prev"
+		had_prev=1
+	fi
+	mv "$NGINX_CONF.new" "$NGINX_CONF"
+	if ! nginx -t; then
+		if [ "$had_prev" -eq 1 ]; then
+			mv "$NGINX_CONF.prev" "$NGINX_CONF"
+			warn "nginx rejected the riam vhost; the previous $NGINX_CONF is back in place"
+		else
+			rm -f "$NGINX_CONF"
+			warn "nginx rejected the riam vhost; $NGINX_CONF removed so nginx stays loadable"
+		fi
+		die "fix the nginx error above and re-run"
+	fi
+	rm -f "$NGINX_CONF.prev"
+	systemctl reload nginx
+}
+
 write_nginx_http_only() {
 	[ "$dry_run" -eq 1 ] && {
 		say "  would: write $NGINX_CONF (http-only) and reload nginx"
 		return 0
 	}
 	install -d -m 755 "$WEBROOT"
-	cat >"$NGINX_CONF" <<EOF
+	install_vhost <<EOF
 server {
     listen 80;
     listen [::]:80;
@@ -372,8 +397,6 @@ server {
     location / { return 301 https://\$host\$request_uri; }
 }
 EOF
-	nginx -t
-	systemctl reload nginx
 }
 
 issue_certs() {
@@ -407,8 +430,9 @@ write_nginx_full() {
 		say "  would: write $NGINX_CONF (tls proxy) and reload nginx"
 		return 0
 	}
-	cat >"$NGINX_CONF" <<EOF
-map \$http_upgrade \$connection_upgrade {
+	# The map variable is global to nginx; a name only riam uses cannot collide with another site's.
+	install_vhost <<EOF
+map \$http_upgrade \$riam_connection_upgrade {
     default upgrade;
     "" close;
 }
@@ -430,15 +454,13 @@ server {
         proxy_pass http://unix:$DATA_DIR/riam.sock;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$connection_upgrade;
+        proxy_set_header Connection \$riam_connection_upgrade;
         proxy_set_header Host \$host;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
 }
 EOF
-	nginx -t
-	systemctl reload nginx
 }
 
 verify_health() {
