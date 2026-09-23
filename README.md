@@ -65,11 +65,13 @@ Restore with `riam restore <archive>`; the archive has to be readable by the ria
 
 ```sh
 riam push test        # send a test push to every subscribed device and report per endpoint
-riam debug-mcp        # serve RIAM's read-only debug tools (logs, push status, config, …) over MCP on stdio
 ```
 
-`riam debug-mcp` is meant to be run by an MCP client over SSH; the SSH login and the
-owner-only admin socket are its only authentication.
+RIAM also serves its read-only debug tools (logs, tool audit, heartbeat, push, config, …)
+as an MCP server over HTTPS at `<your riam host>/mcp/debug`, behind a bearer key. Generate
+the key in the app under Settings → systems → Debug MCP; it is shown once, together with the
+`claude mcp add` line that uses it. Rotate it there whenever you like — the old key stops
+working immediately.
 
 ## Uninstalling
 
