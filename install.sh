@@ -14,6 +14,8 @@ WEBROOT="/var/www/riam-acme"
 CERT_DIR="/etc/nginx/riam-certs"
 NGINX_CONF="/etc/nginx/conf.d/riam.conf"
 UNIT="/etc/systemd/system/riam.service"
+SHELL_HOME="/home/riam-shell"
+SHELL_UNIT="/etc/systemd/system/riam-shell.service"
 
 dry_run=0
 local_src=""
@@ -164,6 +166,57 @@ ensure_user() {
 	act install -d -o riam -g riam -m 750 "$DATA_DIR"
 	act install -d -o riam -g riam -m 700 "$DATA_DIR/workspace"
 	act chmod 750 "$RIAM_HOME"
+}
+
+# RIAM's shell runs as riam-shell: it can use the Space and its own home, never riam's secrets or database.
+ensure_shell_user() {
+	command -v setfacl >/dev/null 2>&1 || act apt-get install -y acl
+	if ! id riam-shell >/dev/null 2>&1; then
+		shell="$(command -v nologin || echo /usr/sbin/nologin)"
+		act useradd --system --create-home --home-dir "$SHELL_HOME" --shell "$shell" riam-shell
+	fi
+	act chmod 750 "$SHELL_HOME"
+	# riam reaches the socket and the Space inside the shell's home; riam-shell reaches only riam's bin/.
+	act setfacl -m u:riam:x "$SHELL_HOME"
+	act setfacl -m u:riam-shell:x "$RIAM_HOME"
+	act install -d -o riam-shell -g riam-shell -m 770 "$SHELL_HOME/space"
+	act setfacl -R -m u:riam:rwX,u:riam-shell:rwX "$SHELL_HOME/space"
+	act setfacl -R -d -m u:riam:rwX,u:riam-shell:rwX "$SHELL_HOME/space"
+	if [ ! -e "$DATA_DIR/workspace/space" ]; then
+		as_riam ln -s "$SHELL_HOME/space" "$DATA_DIR/workspace/space"
+	fi
+}
+
+write_shell_unit() {
+	if [ "$dry_run" -eq 1 ]; then
+		say "  would: write $SHELL_UNIT and (re)start riam-shell.service"
+		return 0
+	fi
+	cat >"$SHELL_UNIT" <<UNIT_EOF
+[Unit]
+Description=RIAM shell runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=riam-shell
+Group=riam-shell
+WorkingDirectory=$SHELL_HOME
+UMask=0007
+ExecStart=$BIN_DIR/riam shell-runner
+Restart=always
+RestartSec=2
+KillMode=process
+Nice=10
+CPUWeight=50
+MemoryMax=75%
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+	systemctl daemon-reload
+	systemctl enable riam-shell
+	systemctl restart riam-shell
 }
 
 grant_nginx() {
@@ -534,6 +587,8 @@ upgrade() {
 	grant_nginx
 	obtain_binary
 	write_unit
+	ensure_shell_user
+	write_shell_unit
 	act systemctl restart riam
 	wait_for_socket
 	verify_health
@@ -555,6 +610,8 @@ main() {
 	grant_nginx
 	obtain_binary
 	write_unit
+	ensure_shell_user
+	write_shell_unit
 	wait_for_socket
 	write_config
 	write_nginx_http_only
