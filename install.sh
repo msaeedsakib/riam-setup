@@ -52,7 +52,8 @@ RIAM installer (linux-aarch64, run as root)
   sudo sh install.sh [options]
 
 On a box that already has riam, the script upgrades it in place: no prompts, nginx
-and certs untouched, the daemon restarted on the new binary.
+and certs untouched, the daemon restarted on the new binary. A first install that
+failed partway is finished instead, by re-running this script.
 
 Options:
   --dry-run          print every action without doing any of it
@@ -137,8 +138,11 @@ ask_domain() {
 		die "that does not look like a domain: $domain"
 }
 
+# riam's own vhost is no conflict: a re-run finishing a half-done install finds the http-only one it wrote.
 check_vhost_conflict() {
-	if nginx -T 2>/dev/null | grep -E '^\s*server_name\b' | grep -qw "$domain"; then
+	if nginx -T 2>/dev/null |
+		awk -v own="$NGINX_CONF" '/^# configuration file / { f = $4; sub(/:$/, "", f); next } f != own' |
+		grep -E '^\s*server_name\b' | grep -qw "$domain"; then
 		die "nginx already serves $domain — pick another domain or remove that vhost"
 	fi
 }
@@ -157,15 +161,31 @@ check_dns() {
 
 # --- user, dirs, nginx seam -------------------------------------------------
 
+# A directory inside a home its user owns can be swapped for a link at any time, so root never
+# creates, chowns or chmods one itself: a link or a foreign owner is refused, and the work runs as that user.
+owned_dir() {
+	user="$1"
+	mode="$2"
+	dir="$3"
+	[ ! -L "$dir" ] || die "$dir is a symlink; refusing to touch it as root — move it aside and re-run"
+	if [ ! -e "$dir" ]; then
+		act runuser -u "$user" -- mkdir -m "$mode" "$dir"
+		return 0
+	fi
+	[ -d "$dir" ] || die "$dir is not a directory; move it aside and re-run"
+	[ "$(stat -c %U "$dir")" = "$user" ] || die "$dir is not owned by $user; fix its owner and re-run"
+	act runuser -u "$user" -- chmod "$mode" "$dir"
+}
+
 ensure_user() {
 	if ! id riam >/dev/null 2>&1; then
 		shell="$(command -v nologin || echo /usr/sbin/nologin)"
 		act useradd --system --create-home --home-dir "$RIAM_HOME" --shell "$shell" riam
 	fi
-	act install -d -o riam -g riam -m 755 "$BIN_DIR"
-	act install -d -o riam -g riam -m 750 "$DATA_DIR"
-	act install -d -o riam -g riam -m 700 "$DATA_DIR/workspace"
 	act chmod 750 "$RIAM_HOME"
+	owned_dir riam 755 "$BIN_DIR"
+	owned_dir riam 750 "$DATA_DIR"
+	owned_dir riam 700 "$DATA_DIR/workspace"
 }
 
 # RIAM's shell runs as riam-shell: it can use the Space and its own home, never riam's secrets or database.
@@ -179,10 +199,10 @@ ensure_shell_user() {
 	# riam reaches the socket and the Space inside the shell's home; riam-shell reaches only riam's bin/.
 	act setfacl -m u:riam:x "$SHELL_HOME"
 	act setfacl -m u:riam-shell:x "$RIAM_HOME"
-	act install -d -o riam-shell -g riam-shell -m 770 "$SHELL_HOME/space"
-	act setfacl -R -m u:riam:rwX,u:riam-shell:rwX "$SHELL_HOME/space"
-	act setfacl -R -d -m u:riam:rwX,u:riam-shell:rwX "$SHELL_HOME/space"
-	if [ ! -e "$DATA_DIR/workspace/space" ]; then
+	owned_dir riam-shell 770 "$SHELL_HOME/space"
+	# -P rejects a link swapped in since the check above, and the ACL is never applied recursively as root.
+	act setfacl -P -m u:riam:rwX,u:riam-shell:rwX,d:u:riam:rwX,d:u:riam-shell:rwX "$SHELL_HOME/space"
+	if [ ! -e "$DATA_DIR/workspace/space" ] && [ ! -L "$DATA_DIR/workspace/space" ]; then
 		as_riam ln -s "$SHELL_HOME/space" "$DATA_DIR/workspace/space"
 	fi
 }
@@ -210,6 +230,8 @@ KillMode=process
 Nice=10
 CPUWeight=50
 MemoryMax=75%
+# Its own /tmp: nothing the shell plants there can be mistaken for a file of the daemon's.
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -264,6 +286,30 @@ verify_sha() {
 	say "Checksum verified: $(basename "$file")"
 }
 
+# The public half of RIAM's release-signing key; the daemon compiles in the same key. publish.sh refuses to sign with any key that does not match this block.
+release_public_key() {
+	cat <<'PEM'
+-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAWAtTPFCfg/8fXmbjVcqq7qcAVg2mO4WBb1rYwr0U2DA=
+-----END PUBLIC KEY-----
+PEM
+}
+
+# Refuse a release index that is not signed by the release key: it names the binary and its checksum, so trusting it unsigned would trust whoever can write to the channel.
+verify_index_signature() {
+	index="$1"
+	sig="$2"
+	work="$3"
+	command -v openssl >/dev/null 2>&1 || act apt-get install -y openssl
+	release_public_key >"$work/release-key.pub"
+	base64 -d <"$sig" >"$work/latest.txt.sig.raw" 2>/dev/null ||
+		die "the release signature is not base64; refusing to install"
+	openssl pkeyutl -verify -pubin -inkey "$work/release-key.pub" -rawin \
+		-in "$index" -sigfile "$work/latest.txt.sig.raw" >/dev/null 2>&1 ||
+		die "the release index is not signed by RIAM's release key; refusing to install"
+	say "Release signature verified"
+}
+
 extract_tarball() {
 	tarball="$1"
 	workdir="$2"
@@ -277,14 +323,17 @@ extract_tarball() {
 	printf '%s' "$found"
 }
 
+# bin/ belongs to riam, so root only stages the binary in its own work dir and the copy into bin/ runs as riam:
+# a link planted there can only redirect the copy to a file riam could already write.
 install_binary() {
 	src="$1"
+	stage="$2"
 	[ "$dry_run" -eq 1 ] || [ -f "$src" ] || die "binary not found: $src"
+	act install -m 0755 "$src" "$stage/riam.new"
+	act chmod 711 "$stage"
 	tmp="$BIN_DIR/.riam.install.$$"
-	act cp "$src" "$tmp"
-	act chown riam:riam "$tmp"
-	act chmod 0755 "$tmp"
-	act mv -f "$tmp" "$BIN_DIR/riam"
+	as_riam install -m 0755 "$stage/riam.new" "$tmp"
+	as_riam mv -f "$tmp" "$BIN_DIR/riam"
 	wrap="/usr/local/bin/.riam.wrap.$$"
 	if [ "$dry_run" -eq 1 ]; then
 		say "  would: write the /usr/local/bin/riam wrapper"
@@ -292,8 +341,9 @@ install_binary() {
 		cat >"$wrap" <<WRAP
 #!/bin/sh
 [ "\$(id -un)" = "riam" ] && exec $BIN_DIR/riam "\$@"
+caller_cwd=\$(pwd)
 cd $RIAM_HOME 2>/dev/null || cd /
-exec sudo -u riam env HOME=$RIAM_HOME $BIN_DIR/riam "\$@"
+exec sudo -u riam env HOME=$RIAM_HOME RIAM_CALLER_CWD="\$caller_cwd" $BIN_DIR/riam "\$@"
 WRAP
 	fi
 	act chmod 0755 "$wrap"
@@ -310,6 +360,8 @@ read_release_index() {
 		bin_sha=""
 		return 0
 	fi
+	fetch "$BASE_URL/latest.txt.sig" "$work/latest.txt.sig"
+	verify_index_signature "$work/latest.txt" "$work/latest.txt.sig" "$work"
 	VERSION="$(awk '$1 == "version" {print $2; exit}' "$work/latest.txt")"
 	[ -n "$VERSION" ] || die "the release index has no version line"
 	bin_file="$(awk -v t="$target" '$1 == t {print $2; exit}' "$work/latest.txt")"
@@ -344,7 +396,7 @@ obtain_binary() {
 		verify_sha "$tarball" "$bin_sha"
 		bin="$(extract_tarball "$tarball" "$work")"
 	fi
-	install_binary "$bin"
+	install_binary "$bin" "$work"
 }
 
 # --- config, systemd --------------------------------------------------------
@@ -361,14 +413,15 @@ write_config() {
 		warn "Note: $cfg already has a [server] section; make sure domain = \"$domain\""
 		return 0
 	fi
-	printf '\n[server]\ndomain = "%s"\n' "$domain" >>"$cfg"
+	# The data dir is riam's, so the append runs as riam and a link there cannot aim root's write elsewhere.
+	printf '\n[server]\ndomain = "%s"\n' "$domain" | runuser -u riam -- sh -c 'cat >>"$1"' sh "$cfg"
 	systemctl restart riam
 	wait_for_socket
 }
 
 write_unit() {
 	if [ "$dry_run" -eq 1 ]; then
-		say "  would: write $UNIT and enable riam.service"
+		say "  would: write $UNIT, enable and (re)start riam.service"
 		return 0
 	fi
 	cat >"$UNIT" <<EOF
@@ -390,12 +443,19 @@ ExecStart=$BIN_DIR/riam daemon
 Restart=always
 RestartSec=2
 TimeoutStopSec=20
+# The daemon never needs sudo or setuid (the shell runner is its own unit), and writes only its home and the Space.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=$RIAM_HOME -$SHELL_HOME/space
 
 [Install]
 WantedBy=multi-user.target
 EOF
 	systemctl daemon-reload
-	systemctl enable --now riam
+	systemctl enable riam
+	# A restart, not --now: a re-run that resumes a half-finished install must not leave the old binary running.
+	systemctl restart riam
 }
 
 wait_for_socket() {
@@ -470,7 +530,8 @@ issue_certs() {
 		curl -fsSL https://get.acme.sh | sh -s "email=$acme_email"
 	fi
 	"$ACME" --set-default-ca --server letsencrypt
-	"$ACME" --issue -d "$domain" -w "$WEBROOT" --keylength ec-256
+	# acme.sh exits 2 when it already holds a cert for the domain that is not due for renewal; install that one.
+	"$ACME" --issue -d "$domain" -w "$WEBROOT" --keylength ec-256 || [ $? -eq 2 ]
 	install -d -m 700 "$CERT_DIR"
 	"$ACME" --install-cert -d "$domain" --ecc \
 		--fullchain-file "$CERT_DIR/fullchain.pem" \
@@ -558,14 +619,25 @@ print_claim() {
 
 # --- upgrade ----------------------------------------------------------------
 
+# Installed means the install finished: the binary and config exist early in a first run, the TLS vhost only at its end.
+# A box without it re-runs the fresh path, which finishes whatever a failed first run left undone.
 existing_install() {
-	[ -x "$BIN_DIR/riam" ] && [ -f "$DATA_DIR/config.toml" ]
+	[ -x "$BIN_DIR/riam" ] && [ -f "$DATA_DIR/config.toml" ] && grep -q 'listen 443' "$NGINX_CONF" 2>/dev/null
+}
+
+# A value from one section of the daemon's config.toml, or nothing.
+config_value() {
+	awk -F'"' -v section="[$1]" -v key="$2" '
+		index($0, section) == 1 { s = 1; next }
+		/^\[/ { s = 0 }
+		s && $1 ~ "^" key "[ \t]*=" { print $2; exit }
+	' "$DATA_DIR/config.toml" 2>/dev/null || true
 }
 
 # The domain an existing box already serves: the daemon's config first, then nginx.
 detect_domain() {
 	[ -n "$domain" ] && return 0
-	domain="$(awk -F'"' '/^\[server\]/ { s = 1; next } /^\[/ { s = 0 } s && $1 ~ /^domain[ \t]*=/ { print $2; exit }' "$DATA_DIR/config.toml" 2>/dev/null)"
+	domain="$(config_value server domain)"
 	[ -n "$domain" ] ||
 		domain="$(awk '$1 == "server_name" { gsub(";", "", $2); print $2; exit }' "$NGINX_CONF" 2>/dev/null)"
 	[ -n "$domain" ] || die "could not tell which domain this box serves — set RIAM_DOMAIN"
@@ -586,14 +658,17 @@ upgrade() {
 	ensure_user
 	grant_nginx
 	obtain_binary
-	write_unit
 	ensure_shell_user
 	write_shell_unit
-	act systemctl restart riam
+	write_unit
 	wait_for_socket
 	verify_health
+	# A box set up by hand after a failed first run never got its update channel; one already set is left alone.
+	[ -n "$(config_value update base_url)" ] || handoff_channel
+	# --local never reads the release index, so the version comes from the binary now installed.
+	new="${VERSION:-$(installed_version)}"
 	say ""
-	say "Upgraded riam $old -> $VERSION. From any sudo user: riam update --now"
+	say "Upgraded riam $old -> $new. From any sudo user: riam update --now"
 }
 
 main() {
@@ -603,15 +678,17 @@ main() {
 	fi
 	[ "$dry_run" -eq 1 ] && say "=== DRY RUN (no changes will be made) ==="
 	preflight
+	# A re-run after a failed first install keeps the domain that run already configured.
+	[ -n "$domain" ] || domain="$(config_value server domain)"
 	ask_domain
 	[ "$dry_run" -eq 1 ] || check_vhost_conflict
 	check_dns
 	ensure_user
 	grant_nginx
 	obtain_binary
-	write_unit
 	ensure_shell_user
 	write_shell_unit
+	write_unit
 	wait_for_socket
 	write_config
 	write_nginx_http_only
